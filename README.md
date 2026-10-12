@@ -60,11 +60,25 @@ python3 prepare.py --source "/path/to/com.netease.id5.app"
 `local_shader_cache/res3` 缓存目录，然后启动修复副本，并跳过
 macOS 的崩溃窗口恢复提示。已在运行时不会强制创建第二个游戏进程。
 
+需要关闭时，双击 `Stop-DWRG.command`，或者执行：
+
+```bash
+./Stop-DWRG.command
+```
+
+关闭脚本仅对本仓库 `work/DWRG-PathFixed.app/client` 的进程发送
+`SIGTERM`，发送前再次核对进程路径。不会结束原 PlayCover 应用、
+其他名为 `client` 的进程，也不会清除数据。没有运行中的副本时可重复执行。
+它不使用 `SIGKILL`；如果应用拒绝退出，请自行关闭游戏窗口。
+
 5. 让游戏完成自身的补丁和核心玩法资源下载，再自行登录。
    后续使用本仓库的启动器，不要打开未修复的旧副本。
 
 **不要移动仓库或 `work/DWRG-PathFixed.app`：签名中的沙盒规则包含
 本机工作副本的绝对路径。移动后需要在新位置重新生成副本。**
+
+本工具保留原应用的 Bundle ID 和已注入的 PlayTools，不复制或改写
+PlayCover 的游戏设置。PlayTools 设置的额外配置流程暂不在本项目范围内。
 
 ## 常见问题
 
@@ -118,6 +132,7 @@ open "/path/to/output/DWRG-PathFixed.app" --args -ApplePersistenceIgnoreState YE
 ```bash
 python3 -m unittest discover -v
 /bin/bash -n Launch-DWRG.command
+/bin/bash -n Stop-DWRG.command
 ```
 
 验证范围和局限见 [TESTING.md](TESTING.md)。

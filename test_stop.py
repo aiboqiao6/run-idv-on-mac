@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-only
 import signal
+import contextlib
+import io
+import shutil
 import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -68,6 +73,44 @@ class StopTests(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError):
             stop.stop_game(self.app)
         self.kill.assert_not_called()
+
+
+class CommandLineTests(unittest.TestCase):
+    def test_no_running_game_is_successful(self):
+        with patch.object(stop.sys, "platform", "darwin"):
+            with patch.object(stop, "stop_game", return_value=0), patch("builtins.print"):
+                self.assertEqual(stop.main(), 0)
+
+    def test_unsupported_platform_is_reported(self):
+        with patch.object(stop.sys, "platform", "linux"):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(stop.main(), 1)
+
+    def test_permission_error_is_reported(self):
+        with patch.object(stop.sys, "platform", "darwin"):
+            with patch.object(stop, "stop_game", side_effect=PermissionError()):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(stop.main(), 1)
+
+
+@unittest.skipUnless(sys.platform == "darwin", "Native shutdown integration requires macOS")
+class NativeIntegrationTests(unittest.TestCase):
+    def test_only_self_created_process_is_stopped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = Path(directory).resolve() / "fixture.app"
+            app.mkdir()
+            executable = app / "client"
+            shutil.copy("/bin/sleep", executable)
+            subprocess.run(["codesign", "--force", "--sign", "-", str(executable)],
+                           check=True, capture_output=True, timeout=10)
+            child = subprocess.Popen([str(executable), "30"])
+            try:
+                self.assertEqual(stop.stop_game(app), 1)
+                self.assertEqual(child.wait(timeout=5), -signal.SIGTERM)
+            finally:
+                if child.poll() is None:
+                    child.terminate()
+                    child.wait(timeout=5)
 
 
 if __name__ == "__main__":
