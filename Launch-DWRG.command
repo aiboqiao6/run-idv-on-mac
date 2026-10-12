@@ -1,8 +1,9 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-only
 set -euo pipefail
 
 work_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-app="$work_dir/DWRG-PathFixed.app"
+app="$work_dir/work/DWRG-PathFixed.app"
 documents="$HOME/Library/Containers/com.netease.id5/Data/Documents"
 
 if [[ ! -d "$app" || ! -f "$app/client" ]]; then

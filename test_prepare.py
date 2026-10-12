@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-only
 import copy
+import contextlib
 import hashlib
+import io
 import plistlib
 import subprocess
 import tempfile
@@ -36,7 +38,7 @@ class WorkcopyTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.source = self.root / "source.app"
         self.source.mkdir()
         self.output = self.root / "work"
@@ -108,6 +110,50 @@ class WorkcopyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             prepare.build_workcopy(self.source, self.output)
         self.assertFalse(self.output.exists())
+
+    def test_executable_symlink_cannot_modify_original(self):
+        target = self.root / "real-client"
+        self.executable.rename(target)
+        self.executable.symlink_to(target)
+        with self.assertRaises(ValueError):
+            prepare.build_workcopy(self.source, self.output)
+        self.assertEqual(target.read_bytes(), self.data)
+
+    def test_non_bundle_directory_is_rejected(self):
+        with self.assertRaises(ValueError):
+            prepare.build_workcopy(self.root, self.output)
+        self.assertFalse(self.output.exists())
+
+
+class CommandLineTests(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(patch.stopall)
+        patch.object(prepare.sys, "argv", ["prepare.py"]).start()
+        patch.object(prepare.sys, "platform", "darwin").start()
+        patch.object(prepare.shutil, "which", return_value="/usr/bin/codesign").start()
+        self.build = patch.object(prepare, "build_workcopy",
+                                  return_value=Path("/tmp/work/example.app")).start()
+
+    def test_success_reports_local_output(self):
+        with patch("builtins.print") as printing:
+            prepare.main()
+        self.build.assert_called_once()
+        self.assertEqual(printing.call_count, 2)
+
+    def test_unsupported_platform_exits_without_build(self):
+        with patch.object(prepare.sys, "platform", "linux"):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as result:
+                prepare.main()
+        self.assertEqual(result.exception.code, 1)
+        self.build.assert_not_called()
+
+    def test_build_failure_has_actionable_error(self):
+        self.build.side_effect = ValueError("Unknown binary")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as result:
+            prepare.main()
+        self.assertEqual(result.exception.code, 1)
+        self.assertIn("Original application was not replaced", stderr.getvalue())
 
 
 if __name__ == "__main__":

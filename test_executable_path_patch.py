@@ -1,7 +1,11 @@
+# SPDX-License-Identifier: GPL-3.0-only
 import hashlib
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch as mock_patch
 
 import executable_path_patch as patch
 
@@ -69,6 +73,24 @@ class ExecutablePathPatchTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 patch.patch_file(Path(directory) / "missing", output, self.digest, self.offset)
             self.assertFalse(output.exists())
+
+
+class CommandLineTests(unittest.TestCase):
+    def test_success_reports_patch_result(self):
+        with mock_patch("sys.argv", ["patch", "/tmp/input", "/tmp/output"]):
+            with mock_patch.object(patch, "patch_file", return_value="a" * 64):
+                with mock_patch("builtins.print") as printing:
+                    patch.main()
+        self.assertIn('"sha256":', printing.call_args.args[0])
+
+    def test_error_is_reported_without_traceback(self):
+        stderr = io.StringIO()
+        with mock_patch("sys.argv", ["patch", "/tmp/input", "/tmp/output"]):
+            with mock_patch.object(patch, "patch_file", side_effect=ValueError("Unknown binary")):
+                with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as result:
+                    patch.main()
+        self.assertEqual(result.exception.code, 1)
+        self.assertIn("Executable path repair failed", stderr.getvalue())
 
 
 if __name__ == "__main__":

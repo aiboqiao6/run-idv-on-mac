@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-only
 import os
 import shutil
 import subprocess
@@ -15,8 +16,8 @@ class LaunchTests(unittest.TestCase):
         source = Path(__file__).with_name(self.launcher.name)
         if source.exists():
             shutil.copyfile(source, self.launcher)
-        self.app = self.root / "DWRG-PathFixed.app"
-        self.app.mkdir()
+        self.app = self.root / "work/DWRG-PathFixed.app"
+        self.app.mkdir(parents=True)
         (self.app / "client").write_bytes(b"fixture")
         self.documents = self.root / "Library/Containers/com.netease.id5/Data/Documents"
         self.documents.mkdir(parents=True)
