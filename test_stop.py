@@ -76,6 +76,15 @@ class StopTests(unittest.TestCase):
 
 
 class CommandLineTests(unittest.TestCase):
+    def test_main_stops_both_owned_layouts(self):
+        with patch.object(stop.sys, 'platform', 'darwin'), \
+                patch.object(stop, 'stop_game', return_value=0) as stop_game, \
+                patch('builtins.print'):
+            self.assertEqual(stop.main(), 0)
+        root = Path(stop.__file__).resolve().parent
+        self.assertEqual([c.args[0] for c in stop_game.call_args_list],
+                         [root / '.pc-launcher/DWRG-PC.app', root / 'work/DWRG-PathFixed.app'])
+
     def test_no_running_game_is_successful(self):
         with patch.object(stop.sys, "platform", "darwin"):
             with patch.object(stop, "stop_game", return_value=0), patch("builtins.print"):

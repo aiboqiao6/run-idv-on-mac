@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 .DS_Store
 work/
+.pc-launcher/
+.native-*.dylib
 evidence/
 coverage/
 .coverage*
@@ -10,6 +12,7 @@ coverage/
 *.ipa
 *.npk
 *.dylib
+!pc-support-tools/libIDVNativeInput-v8.dylib
 *.framework/
 *.plist
 *.log

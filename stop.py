@@ -55,7 +55,9 @@ def main():
         print("Shutdown requires macOS.", file=sys.stderr)
         return 1
     try:
-        count = stop_game(Path(__file__).resolve().parent / "work/DWRG-PathFixed.app")
+        root = Path(__file__).resolve().parent
+        count = sum(stop_game(root / relative) for relative in
+                    ('.pc-launcher/DWRG-PC.app', 'work/DWRG-PathFixed.app'))
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"Shutdown failed: {error}", file=sys.stderr)
         return 1

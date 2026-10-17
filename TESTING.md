@@ -65,3 +65,26 @@ Python 标准库 `trace` 测得可执行行覆盖率：
 只提交源码、测试、说明及 GNU GPL v3 许可证文本。
 生成目录、游戏包、配置、日志和媒体文件均忽略。
 提交作者使用 GitHub noreply 地址，不使用个人邮箱。
+# 当前 v8 工具验证
+
+默认启动器已升级为自动扫描、生成独立签名副本并加载原生 PC 键鼠桥接。
+根目录测试覆盖保留的旧版启动器、补丁准备和两个工作副本路径的精确关闭；
+新启动器和键鼠测试单独运行，避免旧模块与新工具中同名模块的导入冲突：
+
+```bash
+python3 -B -m unittest discover -v
+(cd pc-support-tools && python3 -B -m unittest discover -v)
+bash -n Launch-DWRG.command Launch-Legacy-DWRG.command Stop-DWRG.command
+```
+
+新工具共 73 项：安装扫描、构建签名边界、设置恢复、PID 重查、重建前正常退出、
+Metal HUD 进程环境、键表就绪重试、游戏键位分发、滚轮阻断、坐标方向、
+相机读取前采样、大厅手势许可、场景切换、失焦释放、跨捕获点击、
+通道失败，以及实际 Objective-C 代码的系统捕获失败注入和自由光标事件发布。
+原生测试不会捕获真实系统光标。
+
+v8 已在本机重建启动并发出 READY，加载 123 项绑定。尚未重新确认新大厅取样路径
+的实体鼠标流畅度、稳定 60 FPS、所有角色与模式。日志与菜单面板截图不能代替
+同场景下的完整性能对照。更多当前状态见 pc-support-tools/VERIFICATION.md。
+
+以下为历史启动修复的验证记录，所述旧默认入口现在是 Launch-Legacy-DWRG.command。

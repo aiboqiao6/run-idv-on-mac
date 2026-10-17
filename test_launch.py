@@ -13,7 +13,7 @@ class LaunchTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.launcher = self.root / "Launch-DWRG.command"
-        source = Path(__file__).with_name(self.launcher.name)
+        source = Path(__file__).with_name('Launch-Legacy-DWRG.command')
         if source.exists():
             shutil.copyfile(source, self.launcher)
         self.app = self.root / "work/DWRG-PathFixed.app"
