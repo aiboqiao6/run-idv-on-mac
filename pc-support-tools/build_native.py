@@ -11,7 +11,7 @@ def build() -> Path:
     sdk = Path(subprocess.check_output(
         ['xcrun', '--sdk', 'macosx', '--show-sdk-path'], text=True).strip())
     frameworks = sdk / 'System/iOSSupport/System/Library/Frameworks'
-    output = ROOT / 'libIDVNativeInput-v8.dylib'
+    output = ROOT / 'libIDVNativeInput-v10.dylib'
     with tempfile.TemporaryDirectory(prefix='idv-native-build-') as temporary:
         artifact = Path(temporary) / output.name
         subprocess.run([

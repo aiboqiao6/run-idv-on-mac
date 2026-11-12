@@ -5,6 +5,7 @@
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
+#import <mach/vm_prot.h>
 #import <dlfcn.h>
 #import <sys/socket.h>
 #import <fcntl.h>
@@ -28,6 +29,25 @@ static int cursorError;
 static uint64_t motionEvents;
 static double motionFirst, motionLast;
 static BOOL snapshotPending;
+static uint64_t inputGeneration;
+static BOOL focusKnown, previousFocus;
+static BOOL centerOnUnlock;
+
+static void ClearPending(void) {
+    [mouseEvents removeAllObjects];
+    dx=dy=wheel=0;motionEvents=0;motionFirst=motionLast=0;
+    snapshotPending=NO;
+}
+static void ObserveFocus(BOOL active) {
+    if (!focusKnown || previousFocus!=active) ClearPending();
+    focusKnown=YES;previousFocus=active;
+}
+static unsigned MouseVK(long button) {
+    switch (button) {
+        case 0:return 1; case 1:return 2; case 2:return 4;
+        case 3:return 5; case 4:return 6; default:return 0;
+    }
+}
 
 static id Send(id obj, const char *sel) {
     return ((id(*)(id,SEL))objc_msgSend)(obj, sel_registerName(sel));
@@ -35,6 +55,38 @@ static id Send(id obj, const char *sel) {
 static BOOL Active(void) {
     id app = Send((id)objc_getClass("NSApplication"), "sharedApplication");
     return app && ((BOOL(*)(id,SEL))objc_msgSend)(app,sel_registerName("isActive"));
+}
+static CGPoint QuartzPoint(CGPoint point, CGRect primaryFrame) {
+    // Cocoa screen space has Y up; Quartz global display space has Y down.
+    return CGPointMake(point.x,primaryFrame.origin.y+primaryFrame.size.height-point.y);
+}
+static BOOL WarpCursor(CGPoint point) {
+    if (!isfinite(point.x) || !isfinite(point.y)) return NO;
+    int (*warp)(CGPoint)=dlsym(RTLD_DEFAULT,"CGWarpMouseCursorPosition");
+    int error=warp ? warp(point) : -1;
+    if (error) NSLog(@"IDVPC cursor recenter failed %d",error);
+    return error==0;
+}
+static BOOL CenterCursor(void) {
+    id app=Send((id)objc_getClass("NSApplication"),"sharedApplication");
+    id window=Send(app,"keyWindow");
+    id content=Send(window,"contentView");
+    if (!window || !content) return NO;
+    CGRect rect=((CGRect(*)(id,SEL))objc_msgSend)(content,sel_registerName("bounds"));
+    if (rect.size.width<=0 || rect.size.height<=0) return NO;
+    CGPoint point=CGPointMake(CGRectGetMidX(rect),CGRectGetMidY(rect));
+    point=((CGPoint(*)(id,SEL,CGPoint,id))objc_msgSend)(content,sel_registerName("convertPoint:toView:"),point,nil);
+    point=((CGPoint(*)(id,SEL,CGPoint))objc_msgSend)(window,sel_registerName("convertPointToScreen:"),point);
+    NSArray *screens=Send((id)objc_getClass("NSScreen"),"screens");
+    id primary=screens.firstObject;
+    if (!primary) return NO;
+    CGRect frame=((CGRect(*)(id,SEL))objc_msgSend)(primary,sel_registerName("frame"));
+    return WarpCursor(QuartzPoint(point,frame));
+}
+static void ApplyUnlockCenter(BOOL active) {
+    if (!active || stopped) {centerOnUnlock=NO;return;}
+    if (centerOnUnlock && !locked && !wantLock && CenterCursor())
+        centerOnUnlock=NO;
 }
 static void Coalescing(BOOL capture) {
     id cls=(id)objc_getClass("NSEvent");
@@ -106,6 +158,7 @@ static void PublishMotion(void) {
     // Send on the physical event, not on the independent 120 Hz snapshot timer.
     // Keep unsent displacement for the next event/snapshot if the channel fills.
     NSMutableDictionary *packet=[@{@"kind":@"motion",@"active":@YES,@"locked":@(Capturing()),
+        @"generation":@(inputGeneration),
         @"dx":@(Capturing()?dx:0),@"dy":@(Capturing()?dy:0),@"motion_events":@(motionEvents),
         @"motion_first":@(motionFirst),@"motion_last":@(motionLast),
         @"sent":@(NSProcessInfo.processInfo.systemUptime)} mutableCopy];
@@ -150,15 +203,29 @@ static void ReceiveCommands(void) {
             NSLog(@"IDVPC invalid command %@",error); continue;
         }
         lastCommand=[NSDate date];
+        if (cmd[@"generation"]) {
+            id value=cmd[@"generation"];
+            if (![value isKindOfClass:[NSNumber class]] ||
+                CFGetTypeID((__bridge CFTypeRef)value)==CFBooleanGetTypeID() ||
+                !isfinite([value doubleValue]) || [value doubleValue]<0 ||
+                [value doubleValue]!=floor([value doubleValue])) {
+                NSLog(@"IDVPC invalid input generation");continue;
+            }
+            uint64_t next=[value unsignedLongLongValue];
+            if (next<inputGeneration) continue;
+            if (next!=inputGeneration) {inputGeneration=next;ClearPending();}
+        }
         if ([cmd[@"ready"] boolValue]) {ready=YES;NSLog(@"IDVPC Python adapter ready");}
         if (cmd[@"lock"]) wantLock=[cmd[@"lock"] boolValue];
+        if (wantLock) centerOnUnlock=NO;
+        else if ([cmd[@"center"] isEqual:@YES]) centerOnUnlock=YES;
         if ([cmd[@"stop"] boolValue]) {stopped=YES;wantLock=NO;}
     }
 }
 static void Bootstrap(void) {
     if (ready || (lastBoot && -[lastBoot timeIntervalSinceNow]<1.0)) return;
     lastBoot=[NSDate date];
-    // Exact-build CPython 3.11 addresses, validated before scheduling this timer.
+    // CPython layout addresses, validated before scheduling this timer.
     // The interpreter must exist. The current tstate is normally NULL between
     // engine frames because it releases the GIL while servicing the run loop.
     if (!*(void **)(slide+0x107b85f38)) return;
@@ -189,8 +256,10 @@ static void Bootstrap(void) {
 static void Tick(void) {
     ReceiveCommands();
     BOOL active=Active();
+    ObserveFocus(active);
     if (lastCommand && -[lastCommand timeIntervalSinceNow]>0.5) wantLock=NO;
     Cursor(wantLock && active && !stopped);
+    ApplyUnlockCenter(active);
     if (stopped) { Cleanup(); return; }
     Bootstrap();
     if (!ready) return;
@@ -200,7 +269,7 @@ static void Tick(void) {
         unsigned vk=VK(hid);
         if (vk && [input buttonForKeyCode:(GCKeyCode)hid].pressed) [keys addObject:@(vk)];
     }
-    NSMutableDictionary *packet=[@{@"seq":@(sequence++),@"active":@(active),@"keys":keys.allObjects,@"events":[mouseEvents copy],@"dx":@(Capturing()?dx:0),@"dy":@(Capturing()?dy:0),@"wheel":@(wheel),@"locked":@(Capturing()),@"cursor_error":@(cursorError),@"motion_events":@(motionEvents),@"motion_first":@(motionFirst),@"motion_last":@(motionLast),@"sent":@(NSProcessInfo.processInfo.systemUptime)} mutableCopy];
+    NSMutableDictionary *packet=[@{@"seq":@(sequence++),@"generation":@(inputGeneration),@"active":@(active),@"keys":keys.allObjects,@"events":[mouseEvents copy],@"dx":@(Capturing()?dx:0),@"dy":@(Capturing()?dy:0),@"wheel":@(wheel),@"locked":@(Capturing()),@"cursor_error":@(cursorError),@"motion_events":@(motionEvents),@"motion_first":@(motionFirst),@"motion_last":@(motionLast),@"sent":@(NSProcessInfo.processInfo.systemUptime)} mutableCopy];
     [packet addEntriesFromDictionary:Pointer()];
     NSError *error=nil;
     NSData *data=[NSJSONSerialization dataWithJSONObject:packet options:0 error:&error];
@@ -215,25 +284,43 @@ static void Tick(void) {
     } else {NSLog(@"IDVPC socket send error %d",errno);stopped=YES;Cursor(NO);}
     if (mouseEvents.count>256) {NSLog(@"IDVPC mouse queue overflow; releasing cursor");[mouseEvents removeAllObjects];wantLock=NO;}
 }
+static BOOL ImageContains(const struct mach_header_64 *header, uint64_t address,
+                          uint64_t size, vm_prot_t protection) {
+    if (!header || header->magic!=MH_MAGIC_64 || !size ||
+        header->ncmds>header->sizeofcmds/sizeof(struct load_command)) return NO;
+    const uint8_t *command=(const void *)(header+1);
+    const uint8_t *end=command+header->sizeofcmds;
+    for (uint32_t i=0;i<header->ncmds;i++) {
+        if ((size_t)(end-command)<sizeof(struct load_command)) return NO;
+        const struct load_command *lc=(const void *)command;
+        if (lc->cmdsize<sizeof(*lc) || lc->cmdsize>(size_t)(end-command)) return NO;
+        if (lc->cmd==LC_SEGMENT_64 && lc->cmdsize>=sizeof(struct segment_command_64)) {
+            const struct segment_command_64 *segment=(const void *)command;
+            if (address>=segment->vmaddr && size<=segment->vmsize &&
+                address-segment->vmaddr<=segment->vmsize-size &&
+                (segment->initprot&protection)==protection) return YES;
+        }
+        command+=lc->cmdsize;
+    }
+    return NO;
+}
 __attribute__((constructor)) static void Start(void) {
     @autoreleasepool {
         slide=_dyld_get_image_vmaddr_slide(0);
         const struct mach_header_64 *header=(const void *)_dyld_get_image_header(0);
-        const uint8_t expectedUUID[16]={0x36,0x4b,0xd2,0xd4,0xb1,0x1f,0x34,0xf2,0x8e,0x27,0x69,0x5c,0xed,0xaa,0x4f,0xe8};
-        BOOL uuidMatches=NO;
-        const uint8_t *command=(const void *)(header+1);
-        const uint8_t *end=command+header->sizeofcmds;
-        for (uint32_t i=0;i<header->ncmds && command+sizeof(struct load_command)<=end;i++) {
-            const struct load_command *lc=(const void *)command;
-            if (lc->cmdsize<sizeof(*lc) || command+lc->cmdsize>end) break;
-            if (lc->cmd==LC_UUID && lc->cmdsize>=sizeof(struct uuid_command))
-                uuidMatches=memcmp(((const struct uuid_command *)lc)->uuid,expectedUUID,16)==0;
-            command+=lc->cmdsize;
+        const uint64_t codeAddresses[]={0x1050be054,0x1050be10c,0x105079920,
+            0x1050bf9e8,0x1050bf9d4,0x104fbc4e4};
+        for (unsigned i=0;i<sizeof(codeAddresses)/sizeof(*codeAddresses);i++) {
+            if (!ImageContains(header,codeAddresses[i],4,VM_PROT_READ|VM_PROT_EXECUTE)) {
+                NSLog(@"IDVPC Python entry point is outside executable memory; disabled");return;
+            }
         }
-        if (!uuidMatches) {NSLog(@"IDVPC unsupported executable UUID; disabled");return;}
+        if (!ImageContains(header,0x107b85f38,sizeof(void *),VM_PROT_READ)) {
+            NSLog(@"IDVPC Python state is outside readable memory; disabled");return;
+        }
         NSString *disabled=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/idv-pc-support-disabled"];
         if ([[NSFileManager defaultManager] fileExistsAtPath:disabled]) {NSLog(@"IDVPC disabled by user");return;}
-        // Fail closed on unsupported executables, even when installed manually.
+        // Check actual interpreter instructions, without a UUID/version allowlist.
         if (*(uint32_t *)(slide+0x1050be054)!=0xa9be4ff4 ||
             *(uint32_t *)(slide+0x1050bf9e8)!=0xd10183ff) {
             NSLog(@"IDVPC unsupported Python runtime; disabled"); return;
@@ -252,7 +339,9 @@ __attribute__((constructor)) static void Start(void) {
             for (unsigned i=0;i<sizeof(types)/sizeof(*types);i++) mask|=1ULL<<types[i];
             monitor=((id(*)(id,SEL,uint64_t,id))objc_msgSend)((id)objc_getClass("NSEvent"),sel_registerName("addLocalMonitorForEventsMatchingMask:handler:"),mask,^id(id event){
                 long type=((long(*)(id,SEL))objc_msgSend)(event,sel_registerName("type"));
-                if (!ready || stopped || !Active()) return event;
+                BOOL active=Active();
+                ObserveFocus(active);
+                if (!ready || stopped || !active) return event;
                 if (type==5 || type==6 || type==7 || type==27) {
                     double mx=((double(*)(id,SEL))objc_msgSend)(event,sel_registerName("deltaX"));
                     double my=((double(*)(id,SEL))objc_msgSend)(event,sel_registerName("deltaY"));
@@ -269,14 +358,14 @@ __attribute__((constructor)) static void Start(void) {
                 }
                 else {
                     long button=((long(*)(id,SEL))objc_msgSend)(event,sel_registerName("buttonNumber"));
-                    unsigned key=button==0?1:button==1?2:button==2?4:0;
+                    unsigned key=MouseVK(button);
                     if (key) [mouseEvents addObject:@[@((type==1||type==3||type==25)?1:2),@(key),@(Capturing())]];
                 }
                 return Capturing() ? nil : event;
             });
             inputTimer=[NSTimer scheduledTimerWithTimeInterval:1.0/120.0 repeats:YES block:^(NSTimer *t){(void)t;Tick();}];
             [[NSRunLoop mainRunLoop] addTimer:inputTimer forMode:NSRunLoopCommonModes];
-            NSLog(@"IDVPC input producer started v8");
+            NSLog(@"IDVPC input producer started v10");
         });
     }
 }

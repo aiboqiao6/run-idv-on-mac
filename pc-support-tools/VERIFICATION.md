@@ -6,6 +6,114 @@ discovers supported installations, prepares a signed private copy and starts
 the native helper through LC_LOAD_DYLIB. The bridge remains experimental;
 this does not establish complete Windows-client parity.
 
+## Installation detection without version/hash allowlists — 2026-11-12
+
+- Removed the fixed game-version constant, executable SHA-256 allowlist and
+  source/managed-client hash checks from the launcher. Manifests no longer
+  store game hashes; reuse removes those fields from older manifests. Version
+  metadata is descriptive only and may be absent. Payload integrity and macOS
+  signing checks remain. The standalone historical patch utility is not used
+  by this launch path.
+- Every normal launch automatically searches for an installed bundle by
+  `com.netease.id5` and its executable. `--scan` reports installation paths
+  without version/hash matching and returns 1 with an installation hint if none
+  are found. Real scanning found the PlayCover installation on this Mac.
+- Removed the native fixed-UUID restriction. Before reading interpreter
+  addresses, check the loaded Mach-O segments for readable/executable memory,
+  then verify the existing interpreter entry instructions. Startup patching
+  still verifies its actual target instruction. This removes metadata/hash
+  gates without claiming compatibility with unknown internal layouts.
+- 102 tests pass, including new/missing version metadata, no hashing of game
+  executables during preparation/reuse, old-manifest migration, installed and
+  absent scan results, normal-launch detection before cache reuse, patch-byte
+  refusal and native memory-range/protection validation. Catalyst compilation
+  and helper signing pass. The signed managed workcopy has been rebuilt.
+
+Source backup: `.pc-launcher/source-before-discovery-20261112/`.
+
+## v10 native rendering identity, Space and unlock position — 2026-11-12
+
+- No shortcut or action is assigned by the bridge. The retained game handler
+  and keymap continue to decide capture/release; a regression asserts that
+  the original cursor-shortcut callback and selected mode remain intact.
+- Reproduced logical key clearing followed by a held Space producing a second
+  DOWN after a scene/watchdog release or focus loss. Released keys can now be
+  suppressed until an active snapshot confirms physical UP. Text/IME focus
+  suppresses gameplay DOWN and releases previously accepted gameplay keys.
+  This fixes reproducible input lifecycle defects; the user's unspecified
+  Space symptom still requires verification in its original scenario.
+- An intentional, focused game unlock requests one native cursor recenter.
+  Content-view center converts through window/screen coordinates to Quartz
+  display coordinates. Failed association release delays the warp; losing
+  focus cancels it. No explicit recenter is sent on focus-loss cleanup. Native
+  tests fake the warp boundary and cover displays left of/above the main
+  display, pending requests, and focus cancellation without moving a real cursor.
+- Removed the global replacement of `game3d.is_pc`. `PlatformUtil.is_pc` and
+  `check_use_pc_logic` now opt in only direct UI/input callers and the UI-name
+  selection entry point. Resource loaders nested inside UI calls retain
+  native identity; cached battle-platform refresh sees the native identity.
+  Tests cover both direct and nested resource calls. The v9 global overrides
+  were broader than its input-only intent and could affect LOD/resource policy.
+- Earlier game logs include missing `lod/merge_alpha.png` for ordnance_factory1
+  and h55_demo. v10 has initialized and entered UIBattlePC without a new adapter
+  error; its current map differs from the earlier missing-LOD observation.
+  Absence of that warning on a different map does not prove every distant model
+  is repaired. No render-distance, quality setting, or resource file was forced.
+- 96 tests pass. Native Catalyst build uses `-Wall -Wextra -Werror`; signed helper
+  and rebuilt app verify. Startup logged `READY v10 bindings=123 native_platform=3`
+  at 19:02:13 and `SCENE input=UIBattlePC` at 19:02:55 Asia/Shanghai.
+
+Source backup: `.pc-launcher/source-before-v10-20261112/`. Optional local
+`Documents/idv-input-diagnostic-request` exports existing input/platform/resource
+bytecode at installation to `idv-input-diagnostics.txt`, then renames the request
+to `.consumed`. It executes no requested script and changes no render settings.
+All verification for v10 used terminal tools, logs and offline tests.
+
+## v9 capture and game-mode adaptation — 2026-11-12
+
+- Reproduced captured idle snapshots restoring an off-center system pointer,
+  and the no-op PC recenter function. The retained PC view bytecode calculates
+  rotation from `game.mouse_x/y` minus `GK.g_screen_center`. Captured snapshots
+  now leave a neutral logical pointer; free samples awaiting capture
+  acknowledgement cannot overwrite it. Relative camera calls restore center
+  and zero delta in `finally`, including when the game callback raises.
+- Hook the selected UI's actual `get_view` / `_get_view` method owners, including
+  independent classes and special-mode overrides. Nested calls share one sample
+  through both absolute-position and relative-delta APIs. The game keeps its
+  own sensitivity, watcher/skill logic, keymap and CITY/BRANCH/BATTLE/FIREWORK/
+  WOLVES handler selection. Hall retains its gesture-aware free-pointer path.
+- Historical runtime log at 2026-10-17 21:00:01 shows
+  `UI_REBUILD UIBattleGoldRushPC -> UIBattleGoldRushPC`, followed by a missing
+  skill-manager error. Matching PC UI names now skip rebuilding; UI conversion
+  tolerates modes without a skill manager. Both defects have regression cases.
+- Scene identity includes UI, world, controlled unit and selected key handler.
+  Changes release held inputs, discard pending motion and refresh camera hooks.
+  UP is delivered to the handler that received DOWN. A handler change while
+  draining aborts the old camera call.
+- Native packets and commands carry a capture/scene generation. Old packets
+  cannot replay after relocking or changing modes. Native pending events clear
+  when focus changes, including unsent events retained during backpressure.
+  Duplicate snapshot sequences cannot replay wheel/button payloads. Mouse
+  buttons 4/5 now reach Windows VK 5/6; actions depend on the game's keymap.
+- **88 tests pass** with `/opt/homebrew/bin/python3 -B -m unittest discover -q`.
+  Native tests compile the real producer with fake cursor boundaries and check
+  capture failures, focus clearing, generation changes and mouse-button mapping.
+  Catalyst arm64 compilation uses `-Wall -Wextra -Werror`; helper signing passes.
+
+The managed app was rebuilt and launched on 2026-11-12. System logs confirm
+`IDVPC input producer started v9` at 18:45:47 Asia/Shanghai. After the client
+downloaded its resource update, adapter logs confirm `READY v9 bindings=123
+native_platform=3` at 18:47:59 and `SCENE input=UIHall` at 18:48:18. No new
+adapter error was logged during this startup. A second `--prepare-only` run
+verified payload reuse and the complete application signature. This confirms
+installation and initialization, not physical keyboard/mouse behavior.
+
+These are executable regression and static-code results. Full physical coverage
+of every game mode, character, menu drag, chat/IME and sustained camera
+smoothness remains unverified. No automated multiplayer matches are used.
+The earlier source is preserved in `.pc-launcher/source-before-v9-20261112/`;
+launcher rebuilds preserve previous signed applications.
+
 ## v8 global sampling and launcher — 2026-10-17
 
 - Native motion events now publish free-cursor coordinates as well as captured
@@ -269,7 +377,7 @@ wheel validation/global-block addition described above in the new startup copy.
 
 - Capture cadence measurement and physical smoothness verification.
 - Stable menu drag/cancellation and UI button ownership on capture changes.
-- Quick key edges and auxiliary mouse buttons.
+- Quick key edges; physical verification of auxiliary mouse buttons.
 - Full application rollback selection (previous builds are preserved; settings
   restoration and reuse validation are implemented).
 - Broader skill/character, chat/IME, remapping and transition verification.

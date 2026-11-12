@@ -15,7 +15,7 @@ class RuntimeAdapterTests(unittest.TestCase):
     def make_controller(self):
         timer = types.SimpleNamespace(TimerManager=Mock())
         ui_namespace = {'timer': timer}
-        exec('class UIBattlePC:\n def get_dir(self): pass\n def _get_view(self): pass', ui_namespace)
+        exec('class UIBattlePC:\n def get_dir(self): pass\n def _get_view(self): pass\n def clear_press_info(self): pass', ui_namespace)
         ui_type = ui_namespace['UIBattlePC']
         class UIHall:
             def get_view(self):
@@ -227,10 +227,95 @@ class RuntimeAdapterTests(unittest.TestCase):
         controller.install()
         controller.input.keys.add(87)
         self.assertTrue(game3d.is_key_down(87))
-        self.assertTrue(platform.is_pc())
+        self.assertFalse(platform.is_pc())
         controller.stop()
         self.assertFalse(hasattr(game3d, 'is_key_down'))
         self.assertFalse(platform.is_pc())
+
+    def call_platform_from(self, module_name, function_name, platform):
+        scope = {'__name__': module_name, 'PlatformUtil': platform}
+        exec('def ' + function_name + '():\n return (PlatformUtil.is_pc(), PlatformUtil.check_use_pc_logic())', scope)
+        return scope[function_name]()
+
+    def test_pc_identity_is_limited_to_input_and_ui_selection(self):
+        controller, _, platform, game3d = self.make_controller()
+        native_query = game3d.is_pc
+        controller.install()
+        self.assertIs(game3d.is_pc, native_query)
+        for module, name in (('world.WorldBattle', 'load_model'),
+                             ('core.ResourceManager', 'load_lod'),
+                             ('common_tools.PlatformUtil', '_refresh_pc_like_platform')):
+            self.assertEqual(self.call_platform_from(module, name, platform), (False, False))
+        for module, name in (('ui.UIBattlePC', 'get_view'),
+                             ('core.key_handlers.pc', 'handle_key_battle'),
+                             ('world.WorldBattle', 'get_ui_battle_name'),
+                             ('common_tools.utils', 'lock_cursor')):
+            self.assertEqual(self.call_platform_from(module, name, platform), (True, True))
+        controller.stop()
+
+    def test_render_loader_called_from_ui_keeps_native_platform(self):
+        controller, _, platform, _ = self.make_controller()
+        controller.install()
+        resource = {'__name__': 'core.ResourceManager', 'PlatformUtil': platform}
+        exec('def load_model():\n return PlatformUtil.is_pc()', resource)
+        ui = {'__name__': 'ui.UIModelPreview', 'load_model': resource['load_model']}
+        exec('def show():\n return load_model()', ui)
+        self.assertFalse(ui['show']())
+        controller.stop()
+
+    def test_original_capture_shortcut_callback_is_preserved(self):
+        controller, utils, _, _ = self.make_controller()
+        scope = controller.install.__globals__
+        original = Mock()
+        scope['pc'].check_show_cursor = original
+        controller.install()
+        self.assertIs(scope['pc'].check_show_cursor, original)
+        scope['GK'].g_key_handler_mgr.set_mode.assert_not_called()
+        controller.stop()
+
+    def test_explicit_unlock_requests_native_center_but_focus_loss_does_not(self):
+        controller, utils, _, _ = self.make_controller()
+        utils.lock_cursor.side_effect = lambda value, **kw: setattr(utils, 'g_b_lock_cursor', value)
+        controller.install()
+        controller.focus = True
+        utils.lock_cursor(True)
+        utils.lock_cursor(False)
+        self.assertTrue(controller.command.call_args.kwargs.get('center'))
+        controller.command.reset_mock()
+        utils.lock_cursor(True)
+        controller.focus = False
+        utils.lock_cursor(False, force=True)
+        self.assertFalse(controller.command.call_args.kwargs.get('center'))
+        controller.stop()
+
+    def test_space_in_text_input_does_not_trigger_gameplay(self):
+        controller, _, _, _ = self.make_controller()
+        scope = controller.consume.__globals__
+        director = scope['cc'].Director.getInstance.return_value
+        director.hasIMEDelegate.return_value = True
+        manager = scope['GK'].g_key_handler_mgr
+        controller.consume(dict(seq=1, active=True, keys=[32], events=[]))
+        manager.cur_handler.assert_not_called()
+        self.assertNotIn(32, controller.key_state())
+        director.hasIMEDelegate.return_value = False
+        controller.consume(dict(seq=2, active=True, keys=[32], events=[]))
+        manager.cur_handler.assert_not_called()
+        controller.consume(dict(seq=3, active=True, keys=[], events=[]))
+        controller.consume(dict(seq=4, active=True, keys=[32], events=[]))
+        manager.cur_handler.assert_called_once_with(4, 32)
+
+    def test_text_input_focus_releases_already_held_gameplay_key(self):
+        controller, _, _, _ = self.make_controller()
+        scope = controller.consume.__globals__
+        director = scope['cc'].Director.getInstance.return_value
+        director.hasIMEDelegate.return_value = False
+        manager = scope['GK'].g_key_handler_mgr
+        controller.consume(dict(seq=1, active=True, keys=[32], events=[]))
+        manager.cur_handler.reset_mock()
+        director.hasIMEDelegate.return_value = True
+        controller.consume(dict(seq=2, active=True, keys=[32], events=[]))
+        manager.cur_handler.assert_called_once_with(5, 32)
+        self.assertNotIn(32, controller.key_state())
 
     def test_shutdown_releases_native_even_if_game_key_handler_raises(self):
         controller, _, platform, _ = self.make_controller()
@@ -342,6 +427,240 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(observed, [(876, 531)])
         self.assertEqual(positions[-1], (864, 540))
         controller.stop()
+
+    def track_mouse(self, controller):
+        game = controller.consume.__globals__['game']
+        game.mouse_x, game.mouse_y = (864, 540)
+        game.set_mouse_pos.side_effect = lambda x, y: (
+            setattr(game, 'mouse_x', x), setattr(game, 'mouse_y', y))
+        game.set_mouse_delta.side_effect = lambda x, y: (
+            setattr(game, 'mouse_dx', x), setattr(game, 'mouse_dy', y))
+        def take_delta():
+            result = game.mouse_dx, game.mouse_dy
+            game.set_mouse_delta(0, 0)
+            return result
+        game.get_and_reset_mouse_delta = Mock(side_effect=take_delta)
+        return game
+
+    def test_captured_idle_snapshot_cannot_restore_off_center_system_pointer(self):
+        controller, utils, _, _ = self.make_controller()
+        game = self.track_mouse(controller)
+        controller.install()
+        controller.focus = True
+        utils.g_b_lock_cursor = True
+        for seq in range(1, 5):
+            controller.consume(dict(seq=seq, active=True, keys=[], events=[],
+                locked=True, dx=0, dy=0, x=1100, y=70, width=1334, height=834))
+            self.assertEqual((game.mouse_x, game.mouse_y), (864, 540))
+        controller.stop()
+
+    def test_game_recenter_updates_logical_pointer_without_replaying_delta(self):
+        controller, utils, _, _ = self.make_controller()
+        game = self.track_mouse(controller)
+        controller.install()
+        game.set_mouse_pos(1200, 700)
+        utils.set_cursor_centered()
+        self.assertEqual((game.mouse_x, game.mouse_y), (864, 540))
+        controller.stop()
+
+    def test_free_sample_awaiting_capture_ack_cannot_move_locked_pointer(self):
+        controller, utils, _, _ = self.make_controller()
+        game = self.track_mouse(controller)
+        controller.install()
+        controller.focus = True
+        utils.g_b_lock_cursor = True
+        controller.consume(dict(kind='motion', active=True, locked=False, dx=0, dy=0,
+                                x=1100, y=70, width=1334, height=834))
+        controller.consume(dict(seq=1, active=True, keys=[], events=[], locked=False,
+                                x=1100, y=70, width=1334, height=834))
+        self.assertEqual((game.mouse_x, game.mouse_y), (864, 540))
+        controller.stop()
+
+    def test_special_mode_camera_override_consumes_relative_motion_once(self):
+        controller, utils, _, _ = self.make_controller()
+        game = self.track_mouse(controller)
+        scope = controller.install.__globals__
+        class SpecialMode(scope['UIBattlePC']):
+            def _get_view(self):
+                return game.mouse_x - 864, game.mouse_y - 540
+        controller.install()
+        scope['GK'].input = SpecialMode()
+        controller.tick()
+        controller.focus = True
+        utils.g_b_lock_cursor = True
+        controller.consume(dict(kind='motion', active=True, locked=True, dx=12, dy=-4))
+        self.assertEqual(scope['GK'].input._get_view(), (12, -4))
+        self.assertEqual(scope['GK'].input._get_view(), (0, 0))
+        self.assertEqual((game.mouse_x, game.mouse_y), (864, 540))
+        controller.stop()
+        self.assertEqual(SpecialMode()._get_view(), (0, 0))
+
+    def test_nested_mode_view_does_not_consume_same_sample_twice(self):
+        controller, utils, _, _ = self.make_controller()
+        game = self.track_mouse(controller)
+        scope = controller.install.__globals__
+        base = scope['UIBattlePC']
+        base._get_view = lambda ui: (game.mouse_x - 864, game.mouse_y - 540)
+        class SpecialMode(base):
+            def get_view(self):
+                return self._get_view()
+        controller.install()
+        scope['GK'].input = SpecialMode()
+        controller.tick()
+        controller.focus = True
+        utils.g_b_lock_cursor = True
+        controller.add_motion(7, 3)
+        self.assertEqual(scope['GK'].input.get_view(), (7, 3))
+        self.assertEqual(scope['GK'].input.get_view(), (0, 0))
+        controller.stop()
+
+    def test_independent_mode_can_consume_engine_relative_delta_directly(self):
+        controller, utils, _, _ = self.make_controller()
+        game = self.track_mouse(controller)
+        scope = controller.install.__globals__
+        class IndependentMode:
+            def get_view(self):
+                return game.get_and_reset_mouse_delta()
+        controller.install()
+        scope['GK'].input = IndependentMode()
+        controller.tick()
+        controller.focus = True
+        utils.g_b_lock_cursor = True
+        controller.add_motion(9, -3)
+        self.assertEqual(scope['GK'].input.get_view(), (9, -3))
+        self.assertEqual(scope['GK'].input.get_view(), (0, 0))
+        controller.stop()
+
+    def test_camera_exception_still_clears_relative_sample_and_recenters(self):
+        controller, utils, _, _ = self.make_controller()
+        game = self.track_mouse(controller)
+        scope = controller.install.__globals__
+        scope['UIBattlePC']._get_view = Mock(side_effect=RuntimeError('camera failed'))
+        controller.install()
+        controller.focus = True
+        utils.g_b_lock_cursor = True
+        controller.add_motion(8, 4)
+        with self.assertRaisesRegex(RuntimeError, 'camera failed'):
+            scope['UIBattlePC']()._get_view()
+        self.assertEqual((game.mouse_x, game.mouse_y), (864, 540))
+        self.assertEqual((game.mouse_dx, game.mouse_dy), (0, 0))
+        self.assertEqual(controller.view_depth, 0)
+        controller.stop()
+
+    def test_same_ui_world_transition_releases_previous_inputs(self):
+        controller, utils, _, _ = self.make_controller()
+        game = self.track_mouse(controller)
+        scope = controller.install.__globals__
+        scope['GK'].g_world_mgr = types.SimpleNamespace(cur_world=object())
+        controller.install()
+        controller.tick()
+        controller.focus = True
+        controller.input.keys = {87}
+        controller.add_motion(20, 5)
+        scope['GK'].g_world_mgr.cur_world = object()
+        controller.tick()
+        self.assertEqual(controller.input.keys, set())
+        self.assertEqual((game.mouse_dx, game.mouse_dy), (0, 0))
+        self.assertFalse(utils.g_b_lock_cursor)
+        controller.stop()
+
+    def test_special_pc_ui_is_not_rebuilt_as_itself(self):
+        controller, _, _, _ = self.make_controller()
+        scope = controller.install.__globals__
+        gk = scope['GK']
+        class UIBattleGoldRushPC:
+            pass
+        world = types.SimpleNamespace(get_ui_battle_name=lambda: 'UIBattleGoldRushPC')
+        gk.input = UIBattleGoldRushPC()
+        gk.g_world_mgr = types.SimpleNamespace(cur_world=world, is_world_battle=lambda: True)
+        gk.g_unit = types.SimpleNamespace(skill_mgr=None)
+        gk.g_ui_mgr = Mock()
+        type(controller).rebuild_ui(controller)
+        gk.g_ui_mgr.hide_ui.assert_not_called()
+        self.assertEqual(controller.failed_scenes, set())
+
+    def test_mode_pc_ui_without_skill_manager_can_be_initialized(self):
+        controller, _, _, _ = self.make_controller()
+        scope = controller.install.__globals__
+        gk = scope['GK']
+        class UIBattleGoldRush:
+            pass
+        target = types.SimpleNamespace(root_node=object())
+        world = types.SimpleNamespace(get_ui_battle_name=lambda: 'UIBattleGoldRushPC')
+        gk.input = UIBattleGoldRush()
+        gk.g_world_mgr = types.SimpleNamespace(cur_world=world, is_world_battle=lambda: True)
+        gk.g_unit = types.SimpleNamespace(skill_mgr=None)
+        gk.g_ui_mgr = Mock()
+        gk.g_ui_mgr.get_ui.return_value = target
+        gk.input_proxy = Mock()
+        type(controller).rebuild_ui(controller)
+        self.assertEqual(controller.failed_scenes, set())
+        gk.input_proxy.set_input_handler.assert_called_once_with('UIBattleGoldRushPC', target)
+
+    def test_repeated_snapshot_does_not_replay_mouse_or_wheel(self):
+        controller, _, _, _ = self.make_controller()
+        manager = controller.consume.__globals__['GK'].g_key_handler_mgr
+        frame = dict(seq=1, active=True, keys=[], events=[], wheel=1)
+        controller.consume(frame)
+        controller.consume(frame)
+        manager.on_mouse_wheel.assert_called_once()
+
+    def test_old_capture_generation_cannot_replay_after_relock(self):
+        controller, utils, _, _ = self.make_controller()
+        utils.lock_cursor.side_effect = lambda value, **kw: setattr(utils, 'g_b_lock_cursor', value)
+        game = self.track_mouse(controller)
+        controller.install()
+        controller.focus = True
+        utils.lock_cursor(True, force=True)
+        generation = controller.input_generation
+        utils.lock_cursor(False, force=True)
+        utils.lock_cursor(True, force=True)
+        controller.consume(dict(kind='motion', active=True, locked=True, dx=900, dy=2,
+                                generation=generation))
+        controller.consume(dict(seq=1, active=True, keys=[87], events=[[1, 2, True]],
+                                wheel=1, locked=True, generation=generation))
+        self.assertEqual((game.mouse_dx, game.mouse_dy), (0, 0))
+        self.assertEqual(controller.input.keys, set())
+        self.assertEqual(controller.mouse_down, set())
+        scope = controller.consume.__globals__
+        scope['GK'].g_key_handler_mgr.on_mouse_wheel.assert_not_called()
+        controller.stop()
+
+    def test_mode_handler_change_during_camera_drain_aborts_old_call(self):
+        controller, utils, _, _ = self.make_controller()
+        scope = controller.install.__globals__
+        original = Mock(return_value=(10, 20))
+        scope['UIBattlePC']._get_view = original
+        controller.install()
+        controller.focus = True
+        utils.g_b_lock_cursor = True
+        controller.drain_frames = Mock(side_effect=lambda: setattr(
+            scope['GK'].g_key_handler_mgr, 'cur_handler', Mock()))
+        self.assertEqual(scope['UIBattlePC']()._get_view(), (0, 0))
+        original.assert_not_called()
+        controller.stop()
+
+    def test_unfocused_camera_does_not_reuse_previous_offset(self):
+        controller, utils, _, _ = self.make_controller()
+        scope = controller.install.__globals__
+        original = Mock(return_value=(10, 20))
+        scope['UIBattlePC']._get_view = original
+        controller.install()
+        utils.g_b_lock_cursor = True
+        self.assertEqual(scope['UIBattlePC']()._get_view(), (0, 0))
+        original.assert_not_called()
+        controller.stop()
+
+    def test_release_goes_to_handler_that_received_down(self):
+        controller, _, _, _ = self.make_controller()
+        manager = controller.dispatch.__globals__['GK'].g_key_handler_mgr
+        old, new = Mock(), Mock()
+        manager.cur_handler = old
+        controller.consume(dict(seq=1, active=True, keys=[87], events=[]))
+        manager.cur_handler = new
+        controller.release()
+        old.assert_any_call(5, 87)
+        new.assert_not_called()
 
     def test_absolute_pointer_uses_pc_top_left_origin_for_radial_menus(self):
         controller, _, _, _ = self.make_controller()

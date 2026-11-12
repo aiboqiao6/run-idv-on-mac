@@ -1,4 +1,24 @@
-# 验证记录
+# 当前工具验证（2026-11-12）
+
+默认启动器使用 v10 原生桥接，按安装标识发现游戏，不再限制固定版本号、游戏
+包体哈希或 UUID。新工具的 102 项测试覆盖捕获回中、特殊模式相机、输入代次、
+持键跨场景／失焦抑制、文本焦点、原生解除捕获光标位置，以及安装检测和旧清单迁移。
+原生测试使用伪系统边界，不捕获或移动实体光标。源码与随附桥接库同步更新。
+
+验证命令：
+
+```bash
+python3 -B -m unittest discover -v
+(cd pc-support-tools && python3 -B -m unittest discover -v)
+bash -n Launch-DWRG.command Launch-Legacy-DWRG.command Stop-DWRG.command
+git diff --check
+```
+
+原生库和受管副本已通过签名校验，实机已记录 v10 READY 并进入对局。全部模式、
+空格原始异常场景与远景模型恢复仍需实机复测；详见 pc-support-tools/VERIFICATION.md。
+以下为历史验证记录，其中 v8／旧版哈希限制不代表当前默认启动器行为。
+
+# 历史验证记录
 
 验证日期：2026-10-12。使用合成测试数据，不附带原始日志、
 本机路径、签名配置、进程列表、截图或账号信息。

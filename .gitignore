@@ -13,6 +13,7 @@ coverage/
 *.npk
 *.dylib
 !pc-support-tools/libIDVNativeInput-v8.dylib
+!pc-support-tools/libIDVNativeInput-v10.dylib
 *.framework/
 *.plist
 *.log

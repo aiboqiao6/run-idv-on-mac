@@ -3,6 +3,8 @@
 Executed by the exact-build native helper on the engine's main thread with GIL.
 The inherited socketpair is private to this process; frames never touch disk.
 """
+import functools
+import dis
 import json
 import math
 import os
@@ -53,6 +55,11 @@ class PCSupport:
         self.keymap_retry_at = 0
         self.pointer_position = None
         self.view_pointer = None
+        self.press_handlers = {}
+        self.scene = None
+        self.camera_hooks = set()
+        self.view_depth = 0
+        self.input_generation = 0
 
     def log(self, message):
         try:
@@ -66,6 +73,7 @@ class PCSupport:
     def command(self, **command):
         if self.channel_failed:
             return
+        command.setdefault('generation', self.input_generation)
         try:
             os.write(self.fd, json.dumps(command).encode('ascii'))
         except BlockingIOError:
@@ -80,6 +88,54 @@ class PCSupport:
         self.saved.append((obj, name, getattr(obj, name, self.MISSING)))
         setattr(obj, name, value)
 
+    def write_requested_diagnostics(self):
+        """Export existing input/platform bytecode only on an explicit local request."""
+        request = os.path.expanduser('~/Documents/idv-input-diagnostic-request')
+        if not os.path.isfile(request):
+            return
+        try:
+            path = os.path.expanduser('~/Documents/idv-input-diagnostics.txt')
+            with open(path, 'w', encoding='utf-8') as out:
+                targets = (
+                    (PlatformUtil, ('is_pc', 'is_ios', 'check_use_pc_logic', '_refresh_pc_like_platform')),
+                    (utils, ('lock_cursor', 'set_cursor_battle_mode', 'check_show_cursor', 'set_cursor_centered')),
+                    (game, ('on_key_msg_pre', 'on_mouse_msg_pre', 'on_key_msg', '_default_on_key_msg')),
+                    (GK.g_key_handler_mgr, ('_on_key_msg_pre', 'init_key_map')),
+                )
+                for obj, names in targets:
+                    for name in names:
+                        value = getattr(obj, name, None)
+                        print('FUNCTION', getattr(obj, '__name__', type(obj).__name__), name, file=out)
+                        if callable(value) and hasattr(value, '__code__'):
+                            dis.dis(value, file=out, depth=0)
+                count = 0
+                for module_name, module in list(sys.modules.items()):
+                    if module is None or not module_name.startswith(('core.', 'world.', 'common_tools', 'common_cs.')):
+                        continue
+                    for value in list(vars(module).values()):
+                        candidates = vars(value).items() if isinstance(value, type) else (('', value),)
+                        for name, fn in list(candidates):
+                            if isinstance(fn, (classmethod, staticmethod)):
+                                fn = fn.__func__
+                            if not isinstance(fn, types.FunctionType):
+                                continue
+                            code = fn.__code__
+                            if code is None or not any(word in code.co_name.lower() for word in ('lod', 'cull', 'view_distance', 'get_ui_battle_name')):
+                                continue
+                            print('RESOURCE_FUNCTION', module_name, name or code.co_name, file=out)
+                            dis.dis(fn, file=out, depth=0)
+                            count += 1
+                            if count >= 150:
+                                break
+                        if count >= 150:
+                            break
+                    if count >= 150:
+                        break
+            os.replace(request, request + '.consumed')
+            self.log('DIAGNOSTICS_WRITTEN ' + path)
+        except Exception:
+            self.log('DIAGNOSTICS_FAILED ' + traceback.format_exc())
+
     def rebuild_ui(self):
         manager = getattr(GK, 'g_world_mgr', None)
         world = getattr(manager, 'cur_world', None)
@@ -92,6 +148,8 @@ class PCSupport:
         if not name.endswith('PC') or id(world) in self.failed_scenes:
             return
         oldname = vars(old).get('_class_name', type(old).__name__)
+        if oldname == name:
+            return  # Several special-mode PC UIs do not inherit UIBattlePC.
         self.release()
         self.log('UI_REBUILD ' + oldname + ' -> ' + name)
         try:
@@ -101,7 +159,10 @@ class PCSupport:
                 raise RuntimeError('PC UI factory returned an incomplete object')
             GK.input_proxy.set_input_handler(name, ui)
             GK.g_ui_mgr.show_ui(name)
-            GK.g_unit.skill_mgr.update_skill_icon_ui()
+            skill_mgr = getattr(GK.g_unit, 'skill_mgr', None)
+            refresh = getattr(skill_mgr, 'update_skill_icon_ui', None)
+            if callable(refresh):
+                refresh()
         except Exception:
             self.failed_scenes.add(id(world))
             self.log('UI_REBUILD_FAILED ' + traceback.format_exc())
@@ -117,7 +178,14 @@ class PCSupport:
                 PlatformUtil.check_use_pc_logic = gate
 
     def dispatch(self, msg, key):
+        # UP belongs to the handler that accepted DOWN, even when the game
+        # changes mode before the next snapshot or the scene cleanup timer.
+        token = (msg in (game.MSG_MOUSE_DOWN, game.MSG_MOUSE_UP), key)
         handler = GK.g_key_handler_mgr.cur_handler
+        if msg in (5, game.MSG_MOUSE_UP):
+            handler = self.press_handlers.pop(token, handler)
+        elif msg in (4, game.MSG_MOUSE_DOWN) and handler is not None:
+            self.press_handlers[token] = handler
         if handler is None:
             return
         handler(msg, key)
@@ -125,13 +193,14 @@ class PCSupport:
 
     def release(self):
         self.pointer_position = self.view_pointer = None
-        events = self.input.release()
+        events = self.input.release(suppress_held=True)
         events += [(game.MSG_MOUSE_UP, key) for key in sorted(self.mouse_down)]
         self.mouse_down.clear()
         self.suppressed_mouse.clear()
         actions = [lambda msg=msg, key=key: self.dispatch(msg, key) for msg, key in events]
-        if isinstance(GK.input, UIBattlePC):
-            actions.append(GK.input.clear_press_info)
+        clear = getattr(GK.input, 'clear_press_info', None)
+        if callable(clear):
+            actions.append(clear)
         actions.extend((pc.clear_all_press_state, lambda: game.set_mouse_delta(0, 0)))
         if self.ui_pointer is not None:
             x, y = self.ui_pointer
@@ -142,6 +211,84 @@ class PCSupport:
                 action()
             except Exception:
                 self.log('RELEASE_FAILED ' + traceback.format_exc())
+        self.press_handlers.clear()
+
+    def center_pointer(self, *args, **kwargs):
+        """Implement the PC recenter contract in the game's coordinate space.
+
+        The system cursor is detached while captured. Its fixed absolute
+        location is unrelated to camera motion and must never drive rotation.
+        """
+        cx, cy = GK.g_screen_center
+        game.set_mouse_pos(int(cx), int(cy))
+
+    def scene_identity(self):
+        return (GK.input, getattr(getattr(GK, 'g_world_mgr', None), 'cur_world', None),
+                getattr(GK, 'g_unit', None), GK.g_key_handler_mgr.cur_handler)
+
+    def reconcile_scene(self):
+        current = self.scene_identity()
+        if self.scene is not None and all(a is b for a, b in zip(self.scene, current)):
+            return
+        self.release()
+        utils.set_cursor_battle_mode(False, force=True)
+        self.input_generation += 1
+        self.command(lock=False, generation=self.input_generation)
+        self.rebuild_ui()
+        self.scene = self.scene_identity()
+        self.last_ui = GK.input
+        self.install_scene_camera()
+        self.resume_cursor()
+        self.log('SCENE input=' + type(self.last_ui).__name__)
+
+    def camera_view(self, original, ui, args, kwargs):
+        """Supply one relative sample for a complete, possibly nested view call."""
+        if self.view_depth:
+            return original(ui, *args, **kwargs)
+        if not self.prepare_view():
+            return (0, 0)
+        if not self.focus:
+            self.center_pointer()
+            return (0, 0)
+        if not utils.is_cursor_locked():
+            return original(ui, *args, **kwargs)
+        dx, dy = game.get_and_reset_mouse_delta()
+        cx, cy = GK.g_screen_center
+        self.view_depth += 1
+        try:
+            # Some mode UIs read relative delta directly; others subtract the
+            # screen center. Expose the same sample through both engine APIs.
+            game.set_mouse_delta(dx, dy)
+            game.set_mouse_pos(int(cx) + dx, int(cy) + dy)
+            return original(ui, *args, **kwargs)
+        finally:
+            self.view_depth -= 1
+            game.set_mouse_delta(0, 0)
+            if utils.is_cursor_locked():
+                self.center_pointer()
+
+    def patch_camera(self, cls, name):
+        if (cls, name) in self.camera_hooks:
+            return
+        original = vars(cls).get(name)
+        if not callable(original):
+            return
+        @functools.wraps(original)
+        def view(ui, *args, **kwargs):
+            return self.camera_view(original, ui, args, kwargs)
+        self.patch(cls, name, view)
+        self.camera_hooks.add((cls, name))
+        self.log('CAMERA_INPUT %s.%s' % (cls.__name__, name))
+
+    def install_scene_camera(self):
+        # Special game modes can override either entry point and need not
+        # inherit UIBattlePC. Inspect the selected UI's actual method owners;
+        # retain its own implementation and the game's selected key handler.
+        for cls in type(GK.input).__mro__:
+            for name in ('get_view', '_get_view'):
+                if cls is UIHall and name == 'get_view':
+                    continue  # Hall keeps its gesture-aware free-pointer path.
+                self.patch_camera(cls, name)
 
     def ui_pointer_event(self, phase, point):
         # Per-phase fake events allocate different Touch objects, which cannot
@@ -165,6 +312,12 @@ class PCSupport:
             keys = keys | {game.MOUSE_BUTTON_LEFT}
         return keys
 
+    def text_input_active(self):
+        """Respect the game's Cocos text/IME focus before injecting keys."""
+        director = cc.Director.getInstance()
+        callback = getattr(director, 'hasIMEDelegate', None)
+        return callable(callback) and callback() is True
+
     def resume_cursor(self):
         """Ask the current game UI to restore its own capture policy.
 
@@ -179,16 +332,17 @@ class PCSupport:
         """Sample immediately before any supported camera consumes input."""
         if not self.active or self.draining:
             return False
-        previous = (GK.input, getattr(GK, 'g_unit', None),
-                    getattr(getattr(GK, 'g_world_mgr', None), 'cur_world', None))
+        previous = self.scene_identity()
+        if self.scene is not None and any(a is not b for a, b in zip(self.scene, previous)):
+            self.reconcile_scene()
+            return False
         try:
             self.drain_frames()
         except Exception:
             self.log('VIEW_INPUT_FAILED ' + traceback.format_exc())
             self.stop('camera input channel failed')
             return False
-        current = (GK.input, getattr(GK, 'g_unit', None),
-                   getattr(getattr(GK, 'g_world_mgr', None), 'cur_world', None))
+        current = self.scene_identity()
         return self.active and all(a is b for a, b in zip(previous, current))
 
     def init_keymap(self):
@@ -207,24 +361,43 @@ class PCSupport:
         self.keymap_ready = True
         self.rebuild_ui()
         self.command(ready=True, lock=False)
-        self.log('READY bindings=%d native_platform=%s' % (
+        self.log('READY v10 bindings=%d native_platform=%s' % (
             len(manager.key2op_lst), game3d.get_platform()))
 
     def install(self):
+        self.write_requested_diagnostics()
         old = getattr(pc, '_idv_native_bridge', None)
         if old:
             old['restore']('replaced by complete input adapter')
         # Scope PC identity to presentation/input logic. Native platform stays iOS.
-        self.patch(PlatformUtil, 'is_pc', lambda: True)
-        self.patch(PlatformUtil, 'check_use_pc_logic', lambda *a, **k: True)
-        self.patch(game3d, 'is_pc', lambda: True)
+        manager_module = type(GK.g_key_handler_mgr).__module__
+        def scoped_gate(original):
+            @functools.wraps(original)
+            def gate(*args, **kwargs):
+                caller = sys._getframe(1)
+                module = caller.f_globals.get('__name__', '')
+                name = caller.f_code.co_name
+                if (module.startswith(('ui.', 'core.key_handlers.'))
+                        or module == manager_module
+                        or name == 'get_ui_battle_name'
+                        or (module == 'common_tools.utils' and name in (
+                            'lock_cursor', 'set_cursor_battle_mode', 'show_sys_cursor',
+                            'set_cursor_centered'))):
+                    return True
+                return original(*args, **kwargs)
+            return gate
+        # Native identity and resource/LOD callers must remain on iOS. Only
+        # direct input and UI callers opt into the retained desktop code. A
+        # resource load nested inside UI code still sees its native platform.
+        self.patch(PlatformUtil, 'is_pc', scoped_gate(PlatformUtil.is_pc))
+        self.patch(PlatformUtil, 'check_use_pc_logic', scoped_gate(PlatformUtil.check_use_pc_logic))
         self.patch(game3d, 'is_key_down', lambda key: key in self.key_state())
         self.patch(game3d, 'get_all_key_state', lambda: sorted(self.key_state()))
         PlatformUtil._refresh_pc_like_platform()
         # Native cursor operations are absent on iOS. Keep game's menu/aiming
         # policy, and implement only its platform-specific effects here.
         self.patch(utils, 'show_sys_cursor', lambda *a, **k: None)
-        self.patch(utils, 'set_cursor_centered', lambda *a, **k: None)
+        self.patch(utils, 'set_cursor_centered', self.center_pointer)
         # The retained query gates on is_win32(), unlike lock_cursor's is_pc().
         # Catalyst must report the same policy flag that drives native capture.
         self.patch(utils, 'is_cursor_locked', lambda: bool(utils.g_b_lock_cursor))
@@ -235,33 +408,16 @@ class PCSupport:
             result = original_lock(*args, **kwargs)
             if before != utils.is_cursor_locked():
                 game.set_mouse_delta(0, 0)
+                self.pointer_position = self.view_pointer = None
+                self.center_pointer()
+                self.input_generation += 1
+                self.command(lock=bool(self.focus and utils.is_cursor_locked()),
+                             center=bool(self.focus and not utils.is_cursor_locked()),
+                             generation=self.input_generation)
             return result
 
         self.patch(utils, 'lock_cursor', lock_cursor)
-        original_view = UIBattlePC._get_view
-
-        def relative_view(ui, *args, **kwargs):
-            # The engine timer may run after camera input in a given frame.
-            # Drain pending native samples here so a timer phase cannot make
-            # the camera reuse a previous frame or alternate zero/bursts.
-            # A queued key/button may close this UI or transition the world.
-            # Do not resume a camera call against an object just invalidated.
-            if not self.prepare_view():
-                return (0, 0)
-            if not self.focus or not utils.is_cursor_locked():
-                return original_view(ui, *args, **kwargs)
-            dx, dy = game.get_and_reset_mouse_delta()
-            cx, cy = GK.g_screen_center
-            # NSEvent deltaY already has the PC view sign (up is negative).
-            # Absolute AppKit pointer coordinates use a different convention.
-            game.set_mouse_pos(int(cx) + dx, int(cy) + dy)
-            try:
-                # Retain the game's sensitivity, skill aiming and view clamps.
-                return original_view(ui, *args, **kwargs)
-            finally:
-                game.set_mouse_pos(int(cx), int(cy))
-
-        self.patch(UIBattlePC, '_get_view', relative_view)
+        self.patch_camera(UIBattlePC, '_get_view')
         original_hall_view = UIHall.get_view
 
         def hall_view(ui, *args, **kwargs):
@@ -308,6 +464,11 @@ class PCSupport:
     def consume(self, frame):
         if not isinstance(frame, dict):
             raise ValueError('native packet must be an object')
+        generation = frame.get('generation', self.input_generation)
+        if type(generation) is not int or generation < 0:
+            raise ValueError('invalid input generation')
+        if generation != self.input_generation:
+            return  # Queued input from an old scene/capture must not replay.
         if frame.get('kind') == 'motion':
             if type(frame.get('active')) is not bool or type(frame.get('locked')) is not bool:
                 raise ValueError('invalid motion capture state')
@@ -316,10 +477,14 @@ class PCSupport:
                 raise ValueError('invalid mouse displacement')
             if self.focus and frame['active'] and frame['locked'] and utils.is_cursor_locked():
                 self.add_motion(dx, dy)
-            if self.focus and frame['active'] and not frame['locked']:
+            if (self.focus and frame['active'] and not frame['locked']
+                    and not utils.is_cursor_locked()):
                 self.update_pointer(frame)
             return  # Motion-only packets never reconcile keyboard snapshots.
+        previous_seq = self.input.seq
         events = self.input.update(frame)
+        if self.input.seq == previous_seq:
+            return  # Ignore the whole stale packet, including buttons/wheel.
         self.last_frame = time.monotonic()
         active = frame['active']
         if self.focus != active:
@@ -342,11 +507,16 @@ class PCSupport:
             self.command(lock=False)
             return
         self.cursor_error = 0
+        if active and self.text_input_active():
+            releases = self.input.release(suppress_held=True)
+            events = [(msg, key) for msg, key in events if msg == 5]
+            events.extend((msg, key) for msg, key in releases
+                          if (False, key) in self.press_handlers)
         for msg, key in events:
             self.dispatch(msg, key)
         if not active:
             return
-        if not frame.get('locked'):
+        if not frame.get('locked') and not utils.is_cursor_locked():
             self.update_pointer(frame)
         if frame.get('locked') and self.ui_pointer is not None:
             point, self.ui_pointer = self.ui_pointer, None
@@ -407,14 +577,8 @@ class PCSupport:
         dx, dy = frame.get('dx', 0), frame.get('dy', 0)
         if self.focus and frame.get('locked') and utils.is_cursor_locked():
             self.add_motion(dx, dy)
-        width, height = frame.get('width', 0), frame.get('height', 0)
-        if width > 0 and height > 0:
-            # Retained PC consumers use Neox screen coordinates, with Y down.
-            # nx_pos_to_cocosui_pos then flips Y for Cocos hit tests (radial
-            # actions, quick chat, Witch/friend selection and widget hover).
-            cx, cy = GK.g_screen_center
-            game.set_mouse_pos(frame.get('x', 0) * cx * 2 / width,
-                               (height - frame.get('y', 0)) * cy * 2 / height)
+        if frame.get('locked'):
+            self.center_pointer()
         scroll = frame.get('wheel', 0)
         if type(scroll) not in (int, float) or not math.isfinite(scroll):
             raise ValueError('invalid mouse wheel displacement')
@@ -466,14 +630,7 @@ class PCSupport:
                 if not self.keymap_ready:
                     self.scheduled = timer.TimerManager.add_timer(0.01, self.tick)
                     return
-            ui = GK.input
-            if ui is not self.last_ui:
-                self.release()
-                utils.set_cursor_battle_mode(False, force=True)
-                self.rebuild_ui()
-                self.last_ui = GK.input
-                self.resume_cursor()
-                self.log('SCENE input=' + type(self.last_ui).__name__)
+            self.reconcile_scene()
             self.drain_frames()
             if not self.active:
                 return

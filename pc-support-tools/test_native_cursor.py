@@ -12,6 +12,9 @@ HARNESS = r'''
 #import <dlfcn.h>
 #import <objc/runtime.h>
 static int calls, hides, unhides, failNext, failures;
+static int warps;
+static CGPoint warpPoint;
+static int Warp(CGPoint point) {warps++;warpPoint=point;return 0;}
 static int Associate(BOOL value) {
     (void)value;
     calls++;
@@ -19,7 +22,8 @@ static int Associate(BOOL value) {
     return 0;
 }
 static void *TestDlsym(void *handle, const char *name) {
-    (void)handle; (void)name;
+    (void)handle;
+    if (strcmp(name,"CGWarpMouseCursorPosition")==0) return (void *)Warp;
     return (void *)Associate;
 }
 static void Hide(id self, SEL cmd) { (void)self; (void)cmd; hides++; }
@@ -92,6 +96,53 @@ int main(void) {
                 [NSData dataWithBytes:bytes length:length] options:0 error:nil];
             CHECK([p[@"locked"] boolValue] && [p[@"dx"] doubleValue]==3.5);
         }
+        close(channels[0]);close(channels[1]);channels[0]=channels[1]=-1;
+        CHECK(MouseVK(0)==1 && MouseVK(1)==2 && MouseVK(2)==4);
+        CHECK(MouseVK(3)==5 && MouseVK(4)==6 && MouseVK(5)==0);
+        mouseEvents=[NSMutableArray arrayWithObject:@[@1,@1,@YES]];
+        wheel=3;dx=4;dy=5;motionEvents=1;snapshotPending=YES;
+        ObserveFocus(YES);
+        ObserveFocus(NO);
+        CHECK(mouseEvents.count==0 && wheel==0 && dx==0 && dy==0);
+        CHECK(motionEvents==0 && !snapshotPending);
+        // Even if no inactive snapshot could be sent, refocus cannot replay
+        // queued clicks, wheel or displacement from the previous focus period.
+        [mouseEvents addObject:@[@1,@2,@NO]];wheel=1;
+        ObserveFocus(YES);
+        CHECK(mouseEvents.count==0 && wheel==0);
+        CHECK(socketpair(AF_UNIX,SOCK_DGRAM,0,channels)==0);
+        const char *cmd="{\"generation\":7,\"lock\":true}";
+        [mouseEvents addObject:@[@1,@1,@YES]];dx=20;wheel=2;
+        CHECK(send(channels[1],cmd,strlen(cmd),0)>0);
+        ReceiveCommands();
+        CHECK(inputGeneration==7 && mouseEvents.count==0 && dx==0 && wheel==0);
+        CGPoint p=QuartzPoint(CGPointMake(-800,200),CGRectMake(0,0,1920,1080));
+        CHECK(p.x==-800 && p.y==880); // A screen to the left of the main display.
+        p=QuartzPoint(CGPointMake(1400,1400),CGRectMake(0,0,1920,1080));
+        CHECK(p.x==1400 && p.y==-320); // A screen above the main display.
+        CHECK(WarpCursor(p));
+        CHECK(warps==1 && warpPoint.x==1400 && warpPoint.y==-320);
+        cmd="{\"generation\":7,\"lock\":false,\"center\":true}";
+        CHECK(send(channels[1],cmd,strlen(cmd),0)>0);ReceiveCommands();
+        CHECK(centerOnUnlock && !wantLock);
+        locked=YES;ApplyUnlockCenter(YES);
+        CHECK(centerOnUnlock && warps==1); // Release failure must not move cursor.
+        ApplyUnlockCenter(NO);
+        CHECK(!centerOnUnlock && warps==1); // Never move cursor after losing focus.
+        struct {struct mach_header_64 header;struct segment_command_64 segment;} image={0};
+        image.header.magic=MH_MAGIC_64;image.header.ncmds=1;
+        image.header.sizeofcmds=sizeof(image.segment);
+        image.segment.cmd=LC_SEGMENT_64;image.segment.cmdsize=sizeof(image.segment);
+        image.segment.vmaddr=0x105000000;image.segment.vmsize=0x100000;
+        image.segment.initprot=VM_PROT_READ|VM_PROT_EXECUTE;
+        CHECK(ImageContains(&image.header,0x1050be054,4,VM_PROT_READ|VM_PROT_EXECUTE));
+        CHECK(!ImageContains(&image.header,0x107b85f38,8,VM_PROT_READ));
+        CHECK(!ImageContains(&image.header,0x1050ffffe,4,VM_PROT_READ));
+        image.segment.initprot=VM_PROT_READ;
+        CHECK(!ImageContains(&image.header,0x1050be054,4,VM_PROT_EXECUTE));
+        image.segment.cmdsize=4;
+        CHECK(!ImageContains(&image.header,0x1050be054,4,VM_PROT_READ));
+        CHECK(!ImageContains(NULL,0x1050be054,4,VM_PROT_READ));
         close(channels[0]);close(channels[1]);channels[0]=channels[1]=-1;
     }
     return failures ? 1 : 0;

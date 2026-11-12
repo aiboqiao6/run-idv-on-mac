@@ -1,6 +1,6 @@
-"""Discover, prepare and launch the verified native-PC Identity V workcopy.
+"""Discover installed Identity V bundles and prepare a native-PC workcopy.
 
-Only a private copy is patched. Installation is version guarded and transactional;
+Only a private copy is patched. Installation is identity based and transactional;
 normal startup uses LC_LOAD_DYLIB, never a debugger. No third-party Python package
 or compiler is needed: the reviewed arm64 Catalyst helper is shipped alongside.
 """
@@ -22,20 +22,13 @@ import time
 from macho_load import add_dylib
 
 BUNDLE_ID = 'com.netease.id5'
-VERSION = '26.243.2117'
 APP_NAME = 'DWRG-PC.app'
 LOAD_PATH = '@executable_path/PCSupport/libIDVNativeInput.dylib'
 BRANCH_OFFSET = 0x572E108
 OLD_BRANCH = bytes.fromhex('60020054')
 NEW_BRANCH = bytes.fromhex('13000014')
-SUPPORTED = {
-    '7d6f8003d51f93c8682b01619b193af2b79d600de3b78340f9ac2e8d4aa6405d': 'original',
-    # The same installed build re-signed by the earlier startup repair tooling.
-    '71c075785c13ce2b3b177f6b03999cef4ad1c8966eb8ff2846f3d1fdf43d168b': 'original',
-    '219272c4af5164476bcc6d8a3c0f0b623c595b5fb44fe982ff979255f4118f6d': 'repaired',
-}
-PAYLOAD = ('libIDVNativeInput-v8.dylib', 'runtime_adapter.py', 'input_state.py')
-INSTALLED_NAMES = {'libIDVNativeInput-v8.dylib': 'libIDVNativeInput.dylib'}
+PAYLOAD = ('libIDVNativeInput-v10.dylib', 'runtime_adapter.py', 'input_state.py')
+INSTALLED_NAMES = {'libIDVNativeInput-v10.dylib': 'libIDVNativeInput.dylib'}
 SANDBOX = 'com.apple.security.app-sandbox'
 SBPL = 'com.apple.security.temporary-exception.sbpl'
 SETTINGS = {'keymapping': False, 'disableBuiltinMouse': False,
@@ -81,17 +74,15 @@ def read_info(app: Path) -> dict:
     return info
 
 
-def validate_source(app: Path) -> tuple[str, str]:
+def validate_source(app: Path) -> dict:
+    """Identify an installation without a version gate or executable hash."""
     info = read_info(app)
     executable = app / 'client'
     if executable.is_symlink():
         raise ValueError(f'不支持符号链接可执行文件：{executable}')
-    if info.get('CFBundleShortVersionString') != VERSION:
-        raise ValueError(f'不支持的游戏版本：{app}')
-    digest = sha256(executable)
-    if digest not in SUPPORTED:
-        raise ValueError(f'不支持或已变化的可执行文件：{app} (SHA256 {digest})')
-    return digest, SUPPORTED[digest]
+    if not executable.is_file():
+        raise FileNotFoundError(f'游戏可执行文件不存在：{executable}')
+    return info
 
 
 def scan_roots(roots: list[Path], max_depth: int = 3) -> list[Path]:
@@ -174,12 +165,14 @@ def prepared_app(state: Path, payload: Path) -> Path | None:
             or manifest.get('app') != str(app) or manifest.get('payload') != payload_hashes(payload)):
         raise ValueError('启动副本位置或补丁版本变化，请使用 --rebuild 重新生成')
     read_info(app)
-    if sha256(app / 'client') != manifest.get('client_sha256'):
-        raise ValueError('启动副本的可执行文件校验失败，请使用 --rebuild')
     for name, digest in manifest['payload'].items():
         if sha256(app / 'PCSupport' / name) != digest:
             raise ValueError(f'键鼠补丁校验失败：{name}；请使用 --rebuild')
     run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(app)])
+    if 'source_sha256' in manifest or 'client_sha256' in manifest:
+        manifest.pop('source_sha256', None)
+        manifest.pop('client_sha256', None)
+        atomic_write(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2).encode())
     return app
 
 
@@ -191,14 +184,12 @@ def prepare(source: Path, state: Path, payload: Path, rebuild: bool = False) -> 
     app = state / APP_NAME
     if app.exists() and (not rebuild or not (state / 'manifest.json').is_file()):
         raise FileExistsError('输出已存在；仅 --rebuild 可更新本工具管理的副本')
-    digest, kind = validate_source(source)
+    info = validate_source(source)
     data = (source / 'client').read_bytes()
-    if hashlib.sha256(data).hexdigest() != digest:
-        raise ValueError('复制前游戏文件已变化，请重新运行')
-    expected = OLD_BRANCH if kind == 'original' else NEW_BRANCH
-    if data[BRANCH_OFFSET:BRANCH_OFFSET + 4] != expected:
+    branch = data[BRANCH_OFFSET:BRANCH_OFFSET + 4]
+    if branch not in (OLD_BRANCH, NEW_BRANCH):
         raise ValueError('启动修复指令不匹配')
-    if kind == 'original':
+    if branch == OLD_BRANCH:
         run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(source)])
     extracted = run(['/usr/bin/codesign', '-d', '--entitlements', '-', '--xml', str(source)])
     entitlements = scoped_entitlements(plistlib.loads(extracted.stdout), app)
@@ -215,7 +206,7 @@ def prepare(source: Path, state: Path, payload: Path, rebuild: bool = False) -> 
     try:
         print(f'复制游戏并安装原生键鼠支持：{source}', flush=True)
         run(['/usr/bin/ditto', str(source), str(staging)], 600)
-        if (staging / 'client').is_symlink() or sha256(staging / 'client') != digest:
+        if (staging / 'client').is_symlink() or (staging / 'client').read_bytes() != data:
             raise ValueError('复制后的可执行文件与来源不一致')
         (staging / 'client').write_bytes(installed)
         support = staging / 'PCSupport'
@@ -240,9 +231,9 @@ def prepare(source: Path, state: Path, payload: Path, rebuild: bool = False) -> 
         run(['/usr/bin/codesign', '--verify', '--strict', str(app / 'PCSupport/libIDVNativeInput.dylib')])
         run(['/usr/bin/codesign', '--force', '--sign', '-', '--entitlements', str(entitlement_path), str(app)])
         run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(app)])
-        manifest = dict(schema=1, app=str(app), source=str(source), source_sha256=digest,
-                        client_sha256=sha256(app / 'client'), payload=expected_payload,
-                        version=VERSION, prepared_at=datetime.now().astimezone().isoformat())
+        manifest = dict(schema=1, app=str(app), source=str(source), payload=expected_payload,
+                        version=info.get('CFBundleShortVersionString', ''),
+                        prepared_at=datetime.now().astimezone().isoformat())
         atomic_write(state / 'manifest.json', json.dumps(manifest, ensure_ascii=False, indent=2).encode())
     except Exception:
         if published and app.exists():
@@ -381,13 +372,17 @@ def main() -> int:
     state = PROJECT / '.pc-launcher'
     try:
         if args.scan:
+            installed = 0
             for app in discover():
                 try:
-                    _, kind = validate_source(app)
-                    print(f'支持 ({kind})：{app}')
+                    validate_source(app)
+                    print(f'已安装：{app}')
+                    installed += 1
                 except (OSError, ValueError) as error:
                     print(error)
-            return 0
+            if not installed:
+                print('未检测到已安装的第五人格；请先使用 PlayCover 安装，或用 --app 指定包体。')
+            return 0 if installed else 1
         state.mkdir(mode=0o700, exist_ok=True)
         with (state / 'launcher.lock').open('a') as lock:
             try:
@@ -399,22 +394,22 @@ def main() -> int:
                 restore_settings(settings, state / 'settings-before.plist')
                 print('已恢复启动器修改前的四项 PlayCover 设置，其余设置保留。')
                 return 0
+            candidates = [args.app.resolve()] if args.app else discover()
+            source = None
+            for candidate in candidates:
+                try:
+                    validate_source(candidate)
+                    source = candidate
+                    break
+                except (OSError, ValueError) as error:
+                    print(f'跳过：{error}', file=sys.stderr)
+            if source is None:
+                raise FileNotFoundError('未检测到已安装的第五人格；请先使用 PlayCover 安装，或用 --app 指定包体')
             app = None if args.rebuild or args.app else prepared_app(state, TOOLS)
             if app is None:
                 running = {pid: path for pid, path in game_processes().items() if path == state / APP_NAME}
                 if running and (not args.restart or args.prepare_only):
                     raise ValueError('启动副本仍在运行，请退出后再重建，或使用 --rebuild --restart')
-                candidates = [args.app.resolve()] if args.app else discover()
-                source = None
-                for candidate in candidates:
-                    try:
-                        validate_source(candidate)
-                        source = candidate
-                        break
-                    except (OSError, ValueError) as error:
-                        print(f'跳过：{error}', file=sys.stderr)
-                if source is None:
-                    raise FileNotFoundError('没有找到受支持的第五人格；可使用 --app 指定 PlayCover 游戏包')
                 if running:
                     stop_games(running)
                 app = prepare(source, state, TOOLS, rebuild=args.rebuild)

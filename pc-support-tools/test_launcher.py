@@ -1,5 +1,4 @@
 """Launcher regressions use synthetic bundles, never the installed game."""
-import hashlib
 import json
 from pathlib import Path
 import plistlib
@@ -24,11 +23,9 @@ class LauncherTests(unittest.TestCase):
         (self.source / 'client').chmod(0o755)
         self.info = dict(CFBundleIdentifier=launcher.BUNDLE_ID,
                          CFBundleExecutable='client',
-                         CFBundleShortVersionString=launcher.VERSION)
+                         CFBundleShortVersionString='99.0.0')
         (self.source / 'Info.plist').write_bytes(plistlib.dumps(self.info))
-        self.digest = hashlib.sha256(self.data).hexdigest()
         self.addCleanup(patch.stopall)
-        patch.object(launcher, 'SUPPORTED', {self.digest: 'repaired'}).start()
         patch.object(launcher, 'BRANCH_OFFSET', 4096).start()
         patch.object(launcher, 'NEW_BRANCH', self.data[4096:4100]).start()
         self.payload = self.root / 'payload'
@@ -43,15 +40,44 @@ class LauncherTests(unittest.TestCase):
         shutil.copytree(self.source, nested)
         self.assertEqual(launcher.scan_roots([self.root], max_depth=3), [self.source])
 
-    def test_reject_unknown_build_and_executable_symlink(self):
-        self.assertEqual(launcher.validate_source(self.source)[1], 'repaired')
-        (self.source / 'client').write_bytes(b'unknown version')
-        with self.assertRaisesRegex(ValueError, '不支持'):
-            launcher.validate_source(self.source)
+    def test_detects_installation_without_version_or_executable_hash(self):
+        with patch.object(launcher, 'sha256', side_effect=AssertionError('game must not be hashed')):
+            self.assertEqual(launcher.validate_source(self.source)['CFBundleIdentifier'], launcher.BUNDLE_ID)
+            self.info.pop('CFBundleShortVersionString')
+            (self.source / 'Info.plist').write_bytes(plistlib.dumps(self.info))
+            self.assertEqual(launcher.validate_source(self.source), self.info)
+
+    def test_reject_executable_symlink_or_missing_file(self):
         (self.source / 'client').unlink()
+        with self.assertRaises(FileNotFoundError):
+            launcher.validate_source(self.source)
         (self.source / 'client').symlink_to(self.root / 'outside')
         with self.assertRaisesRegex(ValueError, '符号链接'):
             launcher.validate_source(self.source)
+
+    def test_scan_reports_new_version_as_installed(self):
+        with patch.object(launcher, 'discover', return_value=[self.source]), \
+                patch('sys.argv', ['launcher.py', '--scan']), \
+                patch('builtins.print') as output:
+            self.assertEqual(launcher.main(), 0)
+        self.assertTrue(any('已安装' in str(c) for c in output.call_args_list))
+
+    def test_scan_reports_when_game_is_not_installed(self):
+        with patch.object(launcher, 'discover', return_value=[]), \
+                patch('sys.argv', ['launcher.py', '--scan']), \
+                patch('builtins.print') as output:
+            self.assertEqual(launcher.main(), 1)
+        self.assertTrue(any('未检测到' in str(c) for c in output.call_args_list))
+
+    def test_normal_start_detects_installation_before_reusing_cache(self):
+        with patch.object(launcher, 'PROJECT', self.root), \
+                patch.object(launcher, 'discover', return_value=[]), \
+                patch.object(launcher, 'prepared_app') as cached, \
+                patch('sys.argv', ['launcher.py']), \
+                patch('builtins.print') as output:
+            self.assertEqual(launcher.main(), 1)
+        cached.assert_not_called()
+        self.assertTrue(any('未检测到' in str(c) for c in output.call_args_list))
 
     def test_entitlements_keep_sandbox_and_scope_to_final_location(self):
         original = {launcher.SANDBOX: True, launcher.SBPL: ['existing']}
@@ -112,12 +138,42 @@ class LauncherTests(unittest.TestCase):
                                  (self.payload / name).read_bytes())
             manifest = json.loads((state / 'manifest.json').read_text())
             self.assertEqual(manifest['app'], str(app))
+            self.assertNotIn('source_sha256', manifest)
+            self.assertNotIn('client_sha256', manifest)
+            self.assertEqual(manifest['version'], '99.0.0')
             self.assertEqual(launcher.prepared_app(state, self.payload), app)
             calls = [c.args[0] for c in run.call_args_list]
             self.assertTrue(any('--sign' in c and str(app) in c for c in calls))
             (app / 'PCSupport/input_state.py').write_bytes(b'tampered')
             with self.assertRaisesRegex(ValueError, '校验'):
                 launcher.prepared_app(state, self.payload)
+
+    def test_prepare_and_reuse_never_hash_game_executable(self):
+        state = self.root / 'managed'
+        original_hash = launcher.sha256
+        def payload_only(path):
+            self.assertNotEqual(path.name, 'client')
+            return original_hash(path)
+        with patch.object(launcher, 'run', side_effect=self.fake_run), \
+                patch.object(launcher, 'sha256', side_effect=payload_only):
+            app = launcher.prepare(self.source, state, self.payload)
+            self.assertEqual(launcher.prepared_app(state, self.payload), app)
+            manifest = json.loads((state / 'manifest.json').read_text())
+            manifest.update(source_sha256='legacy', client_sha256='legacy')
+            (state / 'manifest.json').write_text(json.dumps(manifest))
+            self.assertEqual(launcher.prepared_app(state, self.payload), app)
+            updated = json.loads((state / 'manifest.json').read_text())
+            self.assertNotIn('source_sha256', updated)
+            self.assertNotIn('client_sha256', updated)
+
+    def test_unknown_patch_instruction_is_rejected_before_copy(self):
+        data = bytearray(self.data)
+        data[4096:4100] = b'BAD!'
+        (self.source / 'client').write_bytes(data)
+        with patch.object(launcher, 'run') as run:
+            with self.assertRaisesRegex(ValueError, '指令'):
+                launcher.prepare(self.source, self.root / 'managed', self.payload)
+            run.assert_not_called()
 
     def test_failed_signing_keeps_source_and_does_not_publish_manifest(self):
         state = self.root / 'managed'

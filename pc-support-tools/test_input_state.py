@@ -33,6 +33,23 @@ class InputStateTests(unittest.TestCase):
         self.assertEqual(s.release(), [(5, 87), (5, 16)])
         self.assertEqual(s.release(), [])
 
+    def test_held_space_does_not_repeat_after_scene_or_watchdog_release(self):
+        s = InputState()
+        self.assertEqual(s.update(dict(seq=1, active=True, keys=[32])), [(4, 32)])
+        self.assertEqual(s.release(suppress_held=True), [(5, 32)])
+        self.assertEqual(s.update(dict(seq=2, active=True, keys=[32])), [])
+        self.assertEqual(s.update(dict(seq=3, active=True, keys=[])), [])
+        self.assertEqual(s.update(dict(seq=4, active=True, keys=[32])), [(4, 32)])
+
+    def test_space_held_through_focus_loss_requires_a_physical_release(self):
+        s = InputState()
+        s.update(dict(seq=1, active=True, keys=[32]))
+        self.assertEqual(s.update(dict(seq=2, active=False, keys=[])), [(5, 32)])
+        s.update(dict(seq=3, active=False, keys=[]))
+        self.assertEqual(s.update(dict(seq=4, active=True, keys=[32])), [])
+        s.update(dict(seq=5, active=True, keys=[]))
+        self.assertEqual(s.update(dict(seq=6, active=True, keys=[32])), [(4, 32)])
+
 
 if __name__ == '__main__':
     unittest.main()

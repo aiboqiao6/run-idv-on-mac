@@ -7,8 +7,12 @@ class InputState:
     def __init__(self):
         self.keys = set()
         self.seq = -1
+        self.suppressed = set()
 
-    def release(self):
+    def release(self, suppress_held=False):
+        """Release logical keys; optionally require physical UP before reuse."""
+        if suppress_held:
+            self.suppressed.update(self.keys)
         events = [(5, k) for k in sorted(self.keys, key=lambda k: (k in self.MODIFIERS, k))]
         self.keys.clear()
         return events
@@ -25,7 +29,15 @@ class InputState:
             raise ValueError('invalid virtual key')
         if seq <= self.seq:
             return []
-        new = set(keys) if active else set()
+        if active:
+            physical = set(keys)
+            self.suppressed.intersection_update(physical)
+            new = physical - self.suppressed
+        else:
+            # Inactive snapshots contain no reliable physical state. Retain
+            # suppression until an active snapshot confirms the actual UP.
+            self.suppressed.update(self.keys)
+            new = set()
         events = [(5, k) for k in sorted(self.keys - new, key=lambda k: (k in self.MODIFIERS, k))]
         events += [(4, k) for k in sorted(new - self.keys, key=lambda k: (k not in self.MODIFIERS, k))]
         self.keys, self.seq = new, seq
